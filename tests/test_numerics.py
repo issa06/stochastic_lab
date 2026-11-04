@@ -250,7 +250,7 @@ def test_numpy_and_jit_agree(config):
 
 def test_ou_euler_deterministic_recurrence(config):
     m=PotentialModel(ModelSpec(kind='mono',k=1,b=0))
-    cfg=replace(config,A=0,x0=1,burn_cycles=0,trials=1)
+    cfg=replace(config,A=0,x0=1,burn_cycles=0,trials=1,scheme='euler')
     t,x=simulate(m,cfg,0)
     np.testing.assert_allclose(x[0],(1-cfg.actual_dt)**np.arange(len(t)),rtol=1e-10,atol=1e-14)
 
@@ -373,3 +373,4 @@ def test_latex_rendering_has_balanced_braces(config):
     for formula in st.formulas:
         assert formula.count('{')==formula.count('}')
         assert not any(ord(c)<32 for c in formula)
+

@@ -1,9 +1,10 @@
-"""Euler--Maruyama with reproducible streams and optional local JIT acceleration."""
+"""Additive-noise Heun/Euler integration and reproducible coupled refinements."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import numpy as np
 from models import PotentialModel
+from noise import integrated_noise, NOISE_LABELS
 try:
     from numba import njit
     NUMBA_AVAILABLE = True
@@ -22,8 +23,18 @@ class SimConfig:
     seed: int = 2026
     x0: float = -1.0
     segment_cycles: int = 8
+    scheme: str = "heun"
+    noise_kind: str = "white"
+    noise_tau: float = 0.5
 
     def validate(self):
+        if self.scheme not in ("euler", "heun") or self.noise_kind not in NOISE_LABELS:
+            raise ValueError("積分法またはノイズ種類が不正です。")
+        if not np.isfinite(self.noise_tau) or self.noise_tau <= 0:
+            raise ValueError("相関時間 τ > 0 が必要です。")
+        if any(not isinstance(v, (int, np.integer)) for v in
+               (self.cycles, self.burn_cycles, self.trials, self.seed, self.segment_cycles)):
+            raise ValueError("周期数・試行数・seedは整数で指定してください。")
         if not np.all(np.isfinite([self.A, self.f, self.dt, self.x0])):
             raise ValueError("入力値は有限値で指定してください。")
         if self.f <= 0 or self.dt <= 0 or self.A < 0:
@@ -59,8 +70,8 @@ def seed_for(seed: int, D: float, stage: int = 0) -> np.random.SeedSequence:
     return np.random.SeedSequence([int(seed), int(stage), int(bits[0]), int(bits[1])])
 
 
-def _integrate_numpy(coeff, force, noise, dt, scale, initial):
-    n, trials = noise.shape
+def _integrate_numpy(coeff, force, increments, dt, initial, heun):
+    n, trials = increments.shape
     result = np.empty((n + 1, trials))
     result[0] = initial
     for i in range(n):
@@ -68,17 +79,23 @@ def _integrate_numpy(coeff, force, noise, dt, scale, initial):
         drift = np.zeros(trials)
         for value in coeff[::-1]:
             drift = drift * state + value
-        next_state = state + (-drift + force[i]) * dt + scale * noise[i]
+        predictor = state + (-drift + force[i]) * dt + increments[i]
+        next_state = predictor
+        if heun:
+            predicted_drift = np.zeros(trials)
+            for value in coeff[::-1]:
+                predicted_drift = predicted_drift * predictor + value
+            next_state = state + .5*dt*(-drift+force[i]-predicted_drift+force[i+1]) + increments[i]
         if not np.all(np.isfinite(next_state)) or np.any(np.abs(next_state) > 1e6):
-            raise ValueError("Euler–Maruyama が発散しました。dt を小さくしてください。")
+            raise ValueError("数値積分が発散しました。dt を小さくしてください。")
         result[i + 1] = next_state
     return result
 
 
 if NUMBA_AVAILABLE:
     @njit(cache=True)
-    def _integrate_jit(coeff, force, noise, dt, scale, initial):
-        n, trials = noise.shape
+    def _integrate_jit(coeff, force, increments, dt, initial, heun):
+        n, trials = increments.shape
         result = np.empty((n + 1, trials))
         result[0, :] = initial
         for i in range(n):
@@ -87,34 +104,68 @@ if NUMBA_AVAILABLE:
                 drift = 0.0
                 for k in range(len(coeff) - 1, -1, -1):
                     drift = drift * state + coeff[k]
-                value = state + (-drift + force[i]) * dt + scale * noise[i, j]
+                predictor = state + (-drift + force[i]) * dt + increments[i, j]
+                value = predictor
+                if heun:
+                    predicted_drift = 0.0
+                    for k in range(len(coeff)-1, -1, -1):
+                        predicted_drift = predicted_drift * predictor + coeff[k]
+                    value = state + .5*dt*(-drift+force[i]-predicted_drift+force[i+1]) + increments[i, j]
                 if not np.isfinite(value) or abs(value) > 1e6:
-                    raise ValueError("Euler-Maruyama divergence; decrease dt.")
+                    raise ValueError("Integration divergence; decrease dt.")
                 result[i + 1, j] = value
         return result
 
 
 def simulate(model: PotentialModel, config: SimConfig, D: float, stage: int = 0,
-             backend: str = "auto") -> tuple[np.ndarray, np.ndarray]:
+             backend: str = "auto", increments=None) -> tuple[np.ndarray, np.ndarray]:
     config.validate()
     if not np.isfinite(D) or D < 0:
         raise ValueError("D は有限の非負値にしてください。")
     n = config.total_steps
     dt = config.actual_dt
     t = np.arange(n + 1) * dt
-    force = config.A * np.cos(2 * np.pi * config.f * t[:-1])
+    force = config.A * np.cos(2 * np.pi * config.f * t)
     # Each trial has its own stream, unaffected by the requested trial count.
-    children = seed_for(config.seed, D, stage).spawn(config.trials)
-    noise = np.column_stack([np.random.default_rng(child).standard_normal(n) for child in children])
+    if increments is None:
+        increments = integrated_noise(config.noise_kind, D, dt, n, config.trials,
+                                      seed_for(config.seed, D, stage), config.noise_tau)
+    increments = np.asarray(increments, dtype=float)
+    if increments.shape != (n, config.trials) or not np.all(np.isfinite(increments)):
+        raise ValueError("ノイズ増分の形状または値が不正です。")
     integrator = _integrate_jit if NUMBA_AVAILABLE and backend != "numpy" else _integrate_numpy
     with np.errstate(over="ignore", invalid="ignore"):
         try:
-            result = integrator(model.derivative.coef, force, noise, dt, np.sqrt(2 * D * dt), config.x0)
+            result = integrator(model.derivative.coef, force, increments, dt, config.x0, config.scheme == "heun")
         except ValueError:
-            raise ValueError("Euler–Maruyama が発散しました。dt を小さくしてください。") from None
+            raise ValueError("数値積分が発散しました。dt を小さくしてください。") from None
     start = config.burn_cycles * config.steps_per_period
     # Omit the final endpoint to preserve an integer number of sampled cycles.
     return t[start:-1], np.ascontiguousarray(result[start:-1].T)
+
+
+def coupled_simulations(model, config, D, stage=601, levels=3):
+    """Aggregate exact fine-grid noise integrals to preserve the same realization."""
+    if levels not in (2, 3):
+        raise ValueError("刻み比較は2段階または3段階です。")
+    config.validate()
+    configs = [replace(config, dt=config.actual_dt/2**i) for i in range(levels)]
+    # Build exact nested grids even when floating point ceil would add one step.
+    for i, c in enumerate(configs):
+        expected = config.steps_per_period * 2**i
+        configs[i] = replace(c, dt=np.nextafter(1/(config.f*expected), np.inf))
+        configs[i].validate()
+        if configs[i].steps_per_period != expected:
+            raise ValueError("入れ子の時間格子を構築できませんでした。")
+    finest = configs[-1]
+    increments = integrated_noise(config.noise_kind, D, finest.actual_dt, finest.total_steps,
+                                  finest.trials, seed_for(config.seed, D, stage), config.noise_tau)
+    outputs = []
+    for i, c in enumerate(configs):
+        factor = 2**(levels-1-i)
+        grouped = increments.reshape(c.total_steps, factor, c.trials).sum(axis=1)
+        outputs.append((c, *simulate(model, c, D, stage, increments=grouped)))
+    return outputs
 
 
 def core_transitions(x: np.ndarray, t: np.ndarray, model: PotentialModel) -> dict:
@@ -148,3 +199,4 @@ def core_transitions(x: np.ndarray, t: np.ndarray, model: PotentialModel) -> dic
     durations = [e["duration"] for e in events if np.isfinite(e["duration"])]
     return {"events": events, "mean_residence": float(np.mean(durations)) if durations else np.nan,
             "completed": len(durations), "left_censored": 1, "right_censored": 1, "states": states}
+

@@ -9,6 +9,8 @@ from simulation import SimConfig, simulate, core_transitions
 from spectra import SpectralConfig, make_bands, compute_psd, summarize_psd, coherent_amplitude, bootstrap_distribution, summarize_coherent
 import fokker_planck as fp
 import kramers
+from transitions import transition_analysis
+from accuracy import timestep_study, duration_study
 
 
 METHODS = ("MC", "FP", "Kramers")
@@ -32,11 +34,14 @@ def monte_carlo_point(model, config, spectral, D, observable, stage=0, keep_psd=
     else:
         result["ci_method"] = "trial_percentile_bootstrap"
     result.update(coherent_amplitude(t, y, config.f))
-    result.update(method="MC", D=float(D), approximation="Euler_Maruyama", observable=observable,
+    trans = transition_analysis(x,t,model,config.f)
+    result.update(transition_count=len(trans["events"]), unresolved_skips=trans.get("unresolved_skips",0),
+                  transition_edges=trans["edges"], occupancy=trans["occupancy"])
+    result.update(method="MC", D=float(D), approximation=config.scheme, noise_kind=config.noise_kind, observable=observable,
                   actual_dt=config.actual_dt, analysis_time=config.cycles/config.f,
                   stage=stage, eta=result["coherent_power_debiased"]*2/config.A**2 if config.A > 0 else np.nan)
     if keep_psd:
-        result.update(frequency=frequencies, psd=np.mean(psd, axis=0), bands=bands, t=t, x=x[0], y=y[0])
+        result.update(frequency=frequencies, psd=np.mean(psd, axis=0), bands=bands, t=t, x=x[0], y=y[0], transition_analysis=trans)
     return result
 
 
@@ -76,7 +81,7 @@ def run_experiment(spec: ModelSpec, config: SimConfig, spectral: SpectralConfig,
     domain = model.domain(float(D_values.max()), config.A)
     grid = fp.make_grid(domain, nx)
     bands = make_bands(config.actual_dt, config.nperseg, config.f, spectral)
-    rows, trials = [], []
+    rows, trials, transitions, occupancies = [], [], [], []
     total_work = len(D_values) + (refine if refine else 0)
     completed = 0
 
@@ -86,14 +91,20 @@ def run_experiment(spec: ModelSpec, config: SimConfig, spectral: SpectralConfig,
             try:
                 if method == "MC":
                     output = monte_carlo_point(model, config, spectral, D, observable)
+                    transitions.extend(dict(edge,D=D) for edge in output["transition_edges"])
+                    occupancies.extend(dict(row,D=D) for row in output["occupancy"])
                     for i, (total, noise, snr) in enumerate(zip(output["total_trials"], output["noise_trials"], output["snr_trials"])):
                         trials.append({"D": D, "trial": i, "total_power": float(total),
                                        "noise_power": float(noise), "welch_trial_snr": float(snr), "stage": 0,
                                        "coherent_real": float(output["coherent_trials"][i].real) if "coherent_trials" in output else np.nan,
                                        "coherent_imag": float(output["coherent_trials"][i].imag) if "coherent_trials" in output else np.nan})
                 elif method == "FP":
+                    if config.noise_kind != "white":
+                        raise ValueError("1次元FPは白色ガウスノイズのみ対応です。")
                     output = fp.response(model, D, config.A, bands, observable, grid)
                 elif method == "Kramers":
+                    if config.noise_kind != "white":
+                        raise ValueError("このKramers式は白色ガウスノイズのみ対応です。")
                     output = kramers.response(model, D, config.A, bands, observable)
                 else:
                     raise ValueError("未知の解析手法です。")
@@ -105,7 +116,7 @@ def run_experiment(spec: ModelSpec, config: SimConfig, spectral: SpectralConfig,
                     row["status"] = "近似条件に注意"
             except (ValueError, FloatingPointError, ArithmeticError) as error:
                 row = {"method": method, "D": D, "snr": np.nan, "ci_low": np.nan, "ci_high": np.nan,
-                       "observable": observable, "status": "適用外" if method == "Kramers" else "計算失敗",
+                       "observable": observable, "status": "適用外" if method == "Kramers" or (method == "FP" and config.noise_kind != "white") else "計算失敗",
                        "error_type": type(error).__name__}
             rows.append(row)
         completed += 1
@@ -135,6 +146,7 @@ def run_experiment(spec: ModelSpec, config: SimConfig, spectral: SpectralConfig,
             software[package] = "not_installed"
     return {"model": asdict(spec), "simulation": asdict(config), "spectral": asdict(spectral),
             "observable": observable, "domain": domain, "nx": nx, "rows": rows, "trials": trials,
+            "transition_edges": transitions, "occupancies": occupancies,
             "evidence": evidence, "software": software,
             "methods": list(methods), "independent_validation": None,
             "scan_settings": {"coarse_D": D_values.tolist(), "refine": int(refine)},
@@ -196,23 +208,21 @@ def validate_experiment(experiment, progress=None):
     if progress:
         progress(4,8)
     convergence = []
-    for i, (name, cfg) in enumerate([("dt/2", replace(config, dt=config.dt/2)),
-                                    ("観測時間×2", replace(config, cycles=config.cycles*2))]):
-        try:
-            r = monte_carlo_point(model, cfg, spectral, values[1], observable, stage=201+i)
-            add_trial_data(r, name)
-            overlap = bool(np.isfinite(r["ci_low"]) and np.isfinite(peak["ci_low"]) and
-                           max(r["ci_low"], peak["ci_low"]) <= min(r["ci_high"], peak["ci_high"]))
-            convergence.append({"check": name, "snr": r["snr"],
-                                "relative_change": abs(r["snr"]-peak["snr"])/max(abs(peak["snr"]),1e-12),
-                                "ci_overlap": overlap, "result": "PASS" if overlap else "FAIL"})
-        except (ValueError, ArithmeticError):
-            convergence.append({"check": name, "result": "NOT RUN"})
-        if progress:
-            progress(5+i,8)
+    try:
+        convergence.extend(timestep_study(model,config,spectral,values[1],observable))
+    except (ValueError, ArithmeticError):
+        convergence.append({"check":"結合経路 dt/dt2/dt4", "result":"NOT RUN"})
+    try:
+        convergence.append(duration_study(model,config,spectral,values[1],observable))
+    except (ValueError,ArithmeticError):
+        convergence.append({"check":"観測時間 T → 2T（同じ軌道）","result":"NOT RUN"})
+    if progress:
+        progress(6,8)
     bands = make_bands(config.actual_dt, config.nperseg, config.f, spectral)
     domain, nx = tuple(experiment["domain"]), experiment["nx"]
     try:
+        if config.noise_kind != "white":
+            raise NotImplementedError
         base = fp.response(model, values[1], config.A, bands, observable, fp.make_grid(domain, nx))
         mid, radius = (domain[0]+domain[1])/2, (domain[1]-domain[0])/2
         cases = [("FP 格子細分化", domain, min(2001,2*nx-1)),
@@ -222,6 +232,8 @@ def validate_experiment(experiment, progress=None):
             difference = abs(r["snr"]-base["snr"])/max(abs(base["snr"]),1e-12)
             convergence.append({"check": name, "snr": r["snr"], "relative_change": difference,
                                 "threshold": .05, "result": "PASS" if difference <= .05 else "FAIL"})
+    except NotImplementedError:
+        convergence.append({"check":"FP収束比較（白色ノイズのみ）", "result":"NOT APPLICABLE"})
     except (ValueError, ArithmeticError):
         convergence.append({"check": "FP収束比較", "result": "NOT RUN"})
     no_noise_config = replace(config, trials=1)
@@ -230,10 +242,13 @@ def validate_experiment(experiment, progress=None):
     control = {"D_zero_transitions": len(transitions["events"]), "A_zero_snr": null["snr"],
                "subthreshold_trajectory": len(transitions["events"]) == 0}
     supported = all(c["result"]=="PASS" for c in checks)
-    numerical_pass = all(c["result"]=="PASS" for c in convergence)
+    numerical_pass = all(c["result"]=="PASS" for c in convergence if c["result"]!="NOT APPLICABLE")
     if progress:
         progress(8,8)
-    return {"status": "独立試行でピークを支持" if supported else "独立試行では未支持",
+    status = "独立試行でピークを支持" if supported else "独立試行では未支持"
+    if supported and not numerical_pass:
+        status += "（数値精度は未確認）"
+    return {"status": status,
             "checks": checks, "rows": rows, "trials": trials, "convergence": convergence,
             "controls": control, "numerical_checks_pass": numerical_pass,
             "conclusion": "指定した観測量・帯域・探索範囲に限定した統計的支持。一般的証明ではありません。",
@@ -250,7 +265,10 @@ def detail_simulation(experiment, D, dt_fp=.05, max_cycles=80):
     detail = monte_carlo_point(model, replace(config, trials=min(config.trials,8)), spectral,
                               D, observable, stage=401, keep_psd=True)
     detail["transitions"] = core_transitions(detail["x"], detail["t"], model)
-    detail["rates"] = kramers.rate_table(model,D,config.f)
+    detail["rates"] = kramers.rate_table(model,D,config.f) if config.noise_kind == "white" else []
+    if config.noise_kind != "white":
+        detail.update(fp_periodic=None,kramers_periodic=None)
+        return detail
     grid = fp.make_grid(tuple(experiment["domain"]),experiment["nx"])
     detail["fp_periodic"] = fp.periodic_density(model,D,config.A,config.f,observable,grid,
                                               dt_max=dt_fp,max_cycles=max_cycles)
@@ -260,3 +278,4 @@ def detail_simulation(experiment, D, dt_fp=.05, max_cycles=80):
     except (ValueError,ArithmeticError):
         detail["kramers_periodic"] = None
     return detail
+

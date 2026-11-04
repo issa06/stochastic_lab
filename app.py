@@ -15,6 +15,13 @@ from plotting import (potential_figure,sweep_figure,comparison_figure,time_figur
                       density_figure,mean_figure,METHOD_LABELS)
 from exporting import csv_bytes,parameter_rows,experiment_zip
 from equations import render_equations
+from noise import NOISE_LABELS
+from accuracy import timestep_study
+from fokker_planck import make_grid
+from spectra import make_bands
+from nonlinear_fp import resolution_study
+from chaos import DuffingConfig,duffing_refinement
+from plotting import transition_figure,phase_figure,chaos_figure
 
 st.set_page_config(page_title="確率共鳴の比較実験",layout="wide")
 st.title("確率共鳴")
@@ -122,16 +129,29 @@ def show_details(experiment,prefix):
     st.subheader(f"時系列 · D = {D:.5g}")
     st.plotly_chart(time_figure(detail["t"],detail["x"],detail["y"],cfg.A,cfg.f),use_container_width=True,key=f"{prefix}_time")
     st.plotly_chart(psd_figure(detail["frequency"],detail["psd"],detail["bands"]),use_container_width=True,key=f"{prefix}_psd")
-    st.subheader("FP 確率密度")
     periodic=detail["fp_periodic"]
-    st.plotly_chart(density_figure(periodic),use_container_width=True,key=f"{prefix}_density")
-    st.plotly_chart(mean_figure(periodic,detail["kramers_periodic"],cfg.A,cfg.f),use_container_width=True,key=f"{prefix}_means")
-    if not periodic["converged"]:
-        st.warning("FPの周期定常状態が収束判定を満たしていません。反復上限を増やしてください。")
-    with st.expander("保存則・周期収束"):
-        st.dataframe(pd.DataFrame([{"質量誤差":periodic["mass_error"],"最小セル確率":periodic["minimum_probability"],
-                                    "周期間L1差":periodic["periodic_residual"],"端部確率":periodic["boundary_mass"],
-                                    "反復周期数":periodic["cycles"],"実際のFP dt":periodic["dt"]}]),hide_index=True)
+    if periodic is not None:
+        st.subheader("FP 確率密度")
+        st.plotly_chart(density_figure(periodic),use_container_width=True,key=f"{prefix}_density")
+        st.plotly_chart(mean_figure(periodic,detail["kramers_periodic"],cfg.A,cfg.f),use_container_width=True,key=f"{prefix}_means")
+        if not periodic["converged"]:
+            st.warning("FPの周期定常状態が収束判定を満たしていません。反復上限を増やしてください。")
+        with st.expander("保存則・周期収束"):
+            st.dataframe(pd.DataFrame([{"質量誤差":periodic["mass_error"],"最小セル確率":periodic["minimum_probability"],
+                                        "周期間L1差":periodic["periodic_residual"],"端部確率":periodic["boundary_mass"],
+                                        "反復周期数":periodic["cycles"],"実際のFP dt":periodic["dt"]}]),hide_index=True)
+    else:
+        st.info("色付き・二値ノイズはMCで解析します。白色ノイズ用の1次元FP・Kramers式は適用外です。")
+    directed=detail["transition_analysis"]
+    if directed["available"]:
+        st.subheader("多重安定系の遷移")
+        st.plotly_chart(transition_figure(directed),use_container_width=True,key=f"{prefix}_transitions")
+        st.plotly_chart(phase_figure(directed),use_container_width=True,key=f"{prefix}_phases")
+        st.dataframe(pd.DataFrame(directed["occupancy"]),hide_index=True)
+        st.dataframe(pd.DataFrame([{k:v for k,v in edge.items() if k!="phase_counts"} for edge in directed["edges"]]),hide_index=True)
+        st.caption("詳細計算の全試行を集計。率は遷移回数 / 出発井戸の観測滞在時間です。位相集中度は方向別で、少数イベントでは大きく出ることがあります。")
+        if directed["unresolved_skips"]:
+            st.warning("中間井戸を飛び越した観測があります。dtを小さくして遷移経路を再確認してください。")
     st.subheader("遷移と時間尺度")
     trans=detail["transitions"]
     cols=st.columns(3)
@@ -200,12 +220,18 @@ with st.sidebar:
         f=number("周波数 f",.02,.005,.001,key="f")
         observable=st.selectbox("観測量",["q","x"],format_func=lambda x:"井戸状態 q(x)" if x=="q" else "位置 x(t)",key="observable")
     with st.expander("モンテカルロ",expanded=True):
+        scheme=st.selectbox("積分法",["heun","euler"],format_func=lambda x:{"heun":"Heun（既定）","euler":"Euler（比較用）"}[x],key="scheme")
         trials=st.number_input("試行数",min_value=3,max_value=200,value=30,key="trials")
         dt=number("時間刻み上限 dt",.02,.005,.0001,1.0,key="dt")
         cycles=st.number_input("観測周期数",min_value=8,max_value=400,value=48,step=8,key="cycles")
         burn=st.number_input("過渡除外周期数",min_value=0,max_value=200,value=8,key="burn")
         x0=number("初期位置 x₀",-1,.1,key="x0")
         seed=st.number_input("乱数 seed",min_value=0,max_value=2**31-1,value=2026,key="seed")
+    with st.expander("ノイズの種類",expanded=True):
+        noise_kind=st.selectbox("ノイズ",list(NOISE_LABELS),format_func=NOISE_LABELS.get,key="noise_kind")
+        noise_tau=number("相関時間 τ",.5,.1,.001,key="noise_tau")
+        if noise_kind!="white":
+            st.caption("OU・二値の相関は (D/τ) exp(−|時間差|/τ)。相関の片側積分をDに揃えます。")
     with st.expander("ノイズ探索",expanded=True):
         dmin=number("D 最小",.04,.01,.0001,key="dmin")
         dmax=number("D 最大",.4,.05,.001,key="dmax")
@@ -222,7 +248,7 @@ with st.sidebar:
 try:
     model=PotentialModel(spec)
     config=SimConfig(A=A,f=f,dt=dt,cycles=int(cycles),burn_cycles=int(burn),trials=int(trials),
-                     seed=int(seed),x0=x0,segment_cycles=int(segment_cycles))
+                     seed=int(seed),x0=x0,segment_cycles=int(segment_cycles),scheme=scheme,noise_kind=noise_kind,noise_tau=noise_tau)
     config.validate()
     spectral=SpectralConfig(half_width=half_width,aggregation=aggregation)
     if dmax<=dmin: raise ValueError("D最大はD最小より大きくしてください。")
@@ -231,7 +257,7 @@ except ValueError as error:
     safe_error(error)
     st.stop()
 
-experiment_tab,comparison_tab,validation_tab,theory_tab=st.tabs(["実験","系の比較","検証","数式・手法"])
+experiment_tab,comparison_tab,validation_tab,theory_tab,chaos_tab=st.tabs(["実験","系・ノイズの比較","検証","数式・手法","カオス"])
 with experiment_tab:
     phase=st.slider("ポテンシャルの位相 [周期]",0.0,1.0,0.0,.05,key="phase")
     st.plotly_chart(potential_figure(model,A,phase),use_container_width=True,key="potential")
@@ -243,7 +269,7 @@ with experiment_tab:
     if effective_observable(model,observable)!=observable:
         st.info("単安定のため観測量は x(t) を使います。")
     confirm_now=st.checkbox("独立試行・収束検証も実行",value=False,key="confirm_now")
-    if st.button("3手法で解析",type="primary",key="run_main"):
+    if st.button("解析する",type="primary",key="run_main"):
         try:
             exp=run_with_progress(spec,config,spectral,d_grid,observable,nx,refine)
             if confirm_now:
@@ -265,7 +291,7 @@ with experiment_tab:
         show_results(exp)
 
 with comparison_tab:
-    mode=st.selectbox("比較軸",["4つの系","障壁の高さ","非対称性","障壁の数","障壁間の高さ差"],key="comparison_mode")
+    mode=st.selectbox("比較軸",["4つの系","障壁の高さ","非対称性","障壁の数","障壁間の高さ差","ノイズ種類","相関時間"],key="comparison_mode")
     if mode=="4つの系":
         specs=[(LABELS[s.kind],s) for s in preset_specs()]
     elif mode=="障壁の高さ":
@@ -274,17 +300,27 @@ with comparison_tab:
         specs=[(f"c={c:g}",ModelSpec(kind="asymmetric",c=c)) for c in (0,.04,.08,.12)]
     elif mode=="障壁の数":
         specs=[(f"山{n-1}・谷{n}",ModelSpec(kind="barriers",wells=n,c=0,height=.25)) for n in (1,2,3,4)]
-    else:
+    elif mode=="障壁間の高さ差":
         specs=[(f"高さ差係数={s:g}",ModelSpec(kind="barriers",wells=3,c=0,height=.25,skew=s)) for s in (-.7,0,.7)]
+    elif mode=="ノイズ種類":
+        specs=[(NOISE_LABELS[kind],spec) for kind in NOISE_LABELS]
+    else:
+        specs=[(f"τ={tau:g}",spec) for tau in (.1,.5,2.)]
+    cases=[]
+    for i,(label,s) in enumerate(specs):
+        cc=config
+        if mode=="ノイズ種類": cc=replace(config,noise_kind=list(NOISE_LABELS)[i])
+        if mode=="相関時間": cc=replace(config,noise_kind="ou" if config.noise_kind=="white" else config.noise_kind,noise_tau=(.1,.5,2.)[i])
+        cases.append((label,s,cc))
     with st.expander("比較条件"):
         table=[]
-        for label,s in specs:
+        for label,s,cc in cases:
             m=PotentialModel(s)
             es=m.extrema(); barriers=m.barriers()
             table.append({"系":label,"谷":sum(e.kind=="minimum" for e in es),"山":sum(e.kind=="maximum" for e in es),
                           "最小ΔU":min((e.delta_u for e in barriers),default=np.nan),
                           "最大ΔU":max((e.delta_u for e in barriers),default=np.nan),
-                          "観測量":effective_observable(m,observable)})
+                          "観測量":effective_observable(m,observable),"ノイズ":NOISE_LABELS[cc.noise_kind],"τ":cc.noise_tau})
         st.dataframe(pd.DataFrame(table),hide_index=True,use_container_width=True)
         st.write("外力・ノイズ範囲・観測時間・帯域は共通です。単安定のみqを定義できないためxを使います。曲線の絶対値より、各系での非単調性を比較します。")
         st.write("障壁数の系列は平均井戸間隔を固定したChebyshev多項式です。局所曲率まで固定されるわけではありません。")
@@ -294,9 +330,9 @@ with comparison_tab:
         st.session_state["comparison_settings"]=current_comparison_settings
         comparisons=[]
         try:
-            for label,s in specs:
+            for label,s,cc in cases:
                 with st.spinner(f"{label} を計算中"):
-                    result=run_with_progress(s,config,spectral,d_grid,observable,nx,refine)
+                    result=run_with_progress(s,cc,spectral,d_grid,observable,nx,refine)
                 comparisons.append((label,result))
             st.session_state["comparisons"]=comparisons
         except (ValueError,ArithmeticError) as error:
@@ -349,7 +385,7 @@ with validation_tab:
             if validation.get("convergence"):
                 st.subheader("数値条件を変えた比較")
                 st.dataframe(pd.DataFrame(validation["convergence"]),hide_index=True,use_container_width=True)
-                st.caption("MCのPASSは95%CIの重なり、FPのPASSはSNR変化5%以内。収束の証明や同等性検定ではありません。")
+                st.caption("MCは差の95%区間が±max(0.002, SNRの10%)内ならPASS。区間が広い場合はINCONCLUSIVEです。FP線形応答は変化5%以内を確認します。")
             if validation.get("controls"):
                 controls=validation["controls"]
                 st.metric("D=0でのcore-to-core遷移",controls["D_zero_transitions"])
@@ -358,6 +394,41 @@ with validation_tab:
             st.download_button("検証込みの結果を保存",experiment_zip(exp),"validated_experiment.zip","application/zip",key="validation_download")
         else:
             evidence_table(exp)
+
+        st.subheader("指定Dで精度を確認")
+        precision_D=st.selectbox("精度確認するD",sorted({r["D"] for r in exp["rows"]}),key="precision_D")
+        cfg=SimConfig(**exp["simulation"])
+        m=PotentialModel(ModelSpec(**exp["model"]))
+        sc=SpectralConfig(**exp["spectral"])
+        if st.button("結合経路で刻み幅を比較",key="run_precision"):
+            try:
+                with st.spinner("同じノイズ経路で3段階を比較中"):
+                    exp["precision_study"]={"D":precision_D,"checks":timestep_study(m,cfg,sc,precision_D,exp["observable"])}
+            except (ValueError,ArithmeticError) as error:
+                safe_error(error)
+        if exp.get("precision_study"):
+            st.write(f"計算済み D = {exp['precision_study']['D']:.5g}")
+            st.dataframe(pd.DataFrame(exp["precision_study"]["checks"]),hide_index=True)
+        if cfg.noise_kind=="white":
+            with st.expander("有限振幅のFP S/N比"):
+                fp_steps=st.select_slider("1周期の時間分割",[64,128,256,512,1024],value=256,key="nonlinear_steps")
+                fp_lags=st.select_slider("相関の観測周期数",[4,8,16,32,64],value=8,key="nonlinear_lags")
+                if st.button("時間相関からFP S/N比を計算",key="run_nonlinear"):
+                    try:
+                        with st.spinner("周期定常相関と分解能を確認中"):
+                            bands=make_bands(cfg.actual_dt,cfg.nperseg,cfg.f,sc)
+                            exp["nonlinear_fp"]={"selected_D":precision_D,"result":resolution_study(m,precision_D,cfg.A,bands,exp["observable"],make_grid(tuple(exp["domain"]),exp["nx"]),steps=fp_steps,lag_cycles=fp_lags)}
+                    except (ValueError,ArithmeticError) as error:
+                        safe_error(error)
+                if exp.get("nonlinear_fp"):
+                    r=exp["nonlinear_fp"]["result"]
+                    st.write(f"計算済み D = {exp['nonlinear_fp']['selected_D']:.5g}")
+                    st.metric("FP S/N比（有限振幅）",format_number(r["snr"]))
+                    st.dataframe(pd.DataFrame(r["resolution_checks"]),hide_index=True)
+                    if not r["valid"] or not r["resolution_supported"]:
+                        st.warning("周期収束・相関の打切り・境界・分解能の確認が完了していません。")
+                    st.dataframe(pd.DataFrame([{k:r[k] for k in ["periodic_residual","tail_ratio","spectrum_truncation_change","boundary_mass","dt"]}]),hide_index=True)
+        st.download_button("精度確認を含めて保存",experiment_zip(exp),"precision_results.zip","application/zip",key="precision_download")
 
 with theory_tab:
     st.dataframe(pd.DataFrame([
@@ -368,3 +439,33 @@ with theory_tab:
     theory_D=number("数値代入する D",.1,.01,.0001,key="theory_D")
     st.subheader("現在の入力値")
     render_equations(st,model,config,spectral,theory_D)
+
+with chaos_tab:
+    st.subheader("慣性を加えたDuffingモデル")
+    st.latex(r"\ddot x+\gamma\dot x=-U'(x)+A\cos(2\pi f t)")
+    st.caption("ノイズなしの別モデルです。有限時間Lyapunov指数とPoincaré断面を調べ、刻み幅半減と比較します。元の過減衰系の確率共鳴とは分けて評価します。")
+    ca=number("Duffing入力振幅",.3,.05,0.,key="chaos_A")
+    cf=number("Duffing周波数",1.2/(2*np.pi),.01,.001,key="chaos_f")
+    damping=number("減衰 γ",.2,.05,.001,key="chaos_damping")
+    cdt=number("Duffing時間刻み",.02,.005,.001,key="chaos_dt")
+    ccycles=st.number_input("Duffing観測周期",min_value=4,max_value=300,value=100,key="chaos_cycles")
+    cburn=st.number_input("Duffing過渡除外周期",min_value=0,max_value=200,value=40,key="chaos_burn")
+    chaos_settings={"model":asdict(spec),"config":asdict(DuffingConfig(ca,cf,damping,cdt,int(ccycles),int(cburn)))}
+    if st.button("カオス指標を計算",key="run_chaos"):
+        try:
+            with st.spinner("軌道・変分方程式を計算中"):
+                st.session_state["chaos_result"]={"settings":chaos_settings,"result":duffing_refinement(model,DuffingConfig(**chaos_settings["config"]))}
+        except (ValueError,ArithmeticError) as error:
+            safe_error(error)
+    if st.session_state.get("chaos_result"):
+        stored=st.session_state["chaos_result"]
+        if stored["settings"]!=chaos_settings: st.info("表示中は前回の計算条件です。")
+        r=stored["result"]; fine=r["fine"]
+        st.write(fine["classification"])
+        st.metric("有限時間Lyapunov指数",format_number(fine["finite_time_exponent"]))
+        st.plotly_chart(chaos_figure(fine),use_container_width=True,key="chaos_plot")
+        st.write(f"刻み半減による指数差：{r['exponent_difference']:.5g}")
+        if not r["precision_supported"]: st.warning("刻み幅による指数の変動が大きいため、追加検証が必要です。")
+        from exporting import json_safe
+        st.download_button("カオス解析を保存",json.dumps(json_safe(stored),ensure_ascii=False,allow_nan=False),"duffing_diagnostic.json","application/json",key="chaos_download")
+

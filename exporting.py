@@ -41,6 +41,8 @@ def experiment_zip(experiment, detail=None):
         archive.writestr("parameters.csv",csv_bytes(parameter_rows(experiment)))
         archive.writestr("noise_sweep.csv",csv_bytes(experiment["rows"]))
         archive.writestr("trial_results.csv",csv_bytes(experiment["trials"]))
+        archive.writestr("directed_transitions.csv",csv_bytes(experiment.get("transition_edges",[])))
+        archive.writestr("occupancies.csv",csv_bytes(experiment.get("occupancies",[])))
         archive.writestr("experiment.json",json.dumps(json_safe(experiment),ensure_ascii=False,indent=2,allow_nan=False))
         validation=experiment.get("independent_validation")
         if validation:
@@ -56,9 +58,14 @@ def experiment_zip(experiment, detail=None):
             archive.writestr("psd.csv",csv_bytes({"frequency":detail["frequency"],"psd":detail["psd"],"region":region}))
             archive.writestr("kramers_rates.csv",csv_bytes(detail["rates"]))
             archive.writestr("transitions.csv",csv_bytes(detail["transitions"]["events"]))
+            transitions=detail.get("transition_analysis",{})
+            archive.writestr("all_trial_transition_events.csv",csv_bytes(transitions.get("events",[])))
+            archive.writestr("censored_dwell_intervals.csv",csv_bytes(transitions.get("dwell",[])))
             density=detail["fp_periodic"]
-            rows={"time":np.repeat(density["time"],len(density["grid"])),
-                  "x":np.tile(density["grid"],len(density["time"])),
-                  "cell_probability":density["probability"].ravel()}
-            archive.writestr("fp_probability.csv",csv_bytes(rows))
+            if density is not None:
+                rows={"time":np.repeat(density["time"],len(density["grid"])),
+                      "x":np.tile(density["grid"],len(density["time"])),
+                      "cell_probability":density["probability"].ravel()}
+                archive.writestr("fp_probability.csv",csv_bytes(rows))
     return out.getvalue()
+
