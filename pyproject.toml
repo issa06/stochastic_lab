@@ -1,8 +1,8 @@
 [project]
 name = "stochastic-resonance-lab"
-version = "2.0.0"
+version = "2.1.0"
 description = "Monte Carlo, Kramers and Fokker-Planck comparison for stochastic resonance"
-requires-python = ">=3.11,<3.15"
+requires-python = ">=3.11,<3.14"
 dependencies = [
   "numpy>=1.26,<3",
   "scipy>=1.12,<2",
@@ -21,3 +21,5 @@ package = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+pythonpath = ["."]
+

@@ -119,3 +119,32 @@ def mean_figure(fp_result,k_result,A,f):
     if k_result:
         fig.add_scatter(x=k_result["time"],y=k_result["mean"],name="Kramers 状態平均",line=dict(dash="dash"))
     return finish(fig,"周期内の時間 t","期待値 〈g(X)〉",320)
+
+
+def transition_figure(result):
+    labels=[str(r["state"]) for r in result["occupancy"]]
+    fig=go.Figure(go.Heatmap(x=labels,y=labels,z=result["counts"],colorbar=dict(title="回数")))
+    return finish(fig,"到着井戸","出発井戸",330)
+
+
+def phase_figure(result):
+    fig=go.Figure()
+    for edge in result["edges"]:
+        if not edge["count"]:
+            continue
+        n=len(edge["phase_counts"])
+        fig.add_scatter(x=(np.arange(n)+.5)/n,y=edge["phase_counts"],mode="lines+markers",
+                        name=f"{edge['source']} → {edge['target']}")
+    return finish(fig,"周期入力の位相 [周期]","遷移回数",330)
+
+
+def chaos_figure(result):
+    fig=make_subplots(rows=1,cols=2,subplot_titles=["位相平面","Poincaré断面"])
+    trace,section=result["trace"],result["poincare"]
+    fig.add_scatter(x=trace[:,1],y=trace[:,2],mode="lines",name="軌道",row=1,col=1)
+    fig.add_scatter(x=section[:,0],y=section[:,1],mode="markers",name="周期ごとの状態",row=1,col=2)
+    fig.update_xaxes(title_text="x")
+    fig.update_yaxes(title_text="v")
+    fig.update_layout(height=380,margin=dict(l=30,r=20,t=40,b=40),showlegend=False)
+    return fig
+

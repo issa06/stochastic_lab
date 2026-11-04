@@ -13,6 +13,9 @@ REFERENCES = [
     ("二状態モデル・コヒーレント／非コヒーレント成分", "https://arxiv.org/abs/cond-mat/0308627"),
     ("FP有限体積法・Scharfetter–Gummel", "https://arxiv.org/abs/2002.09385"),
     ("応答とSNRの最適ノイズは同一とは限らない", "https://doi.org/10.1103/PhysRevA.42.2030"),
+    ("有限振幅応答・同期成分と非同期相関の分離", "https://doi.org/10.1103/PhysRevE.67.036109"),
+    ("多重安定系と中間状態", "https://doi.org/10.1103/PhysRevE.82.011139"),
+    ("色付きノイズと多重安定系", "https://doi.org/10.1063/1.5030578"),
 ]
 
 
@@ -23,9 +26,23 @@ def render_equations(st, model: PotentialModel, config: SimConfig, spectral: Spe
     st.subheader("ポテンシャルと時間発展")
     st.latex(r"U(x)="+model.latex())
     st.latex(r"-U'(x)="+model.latex(derivative=True))
-    st.latex(r"dX_t=[-U'(X_t)+A\cos(\Omega t)]dt+\sqrt{2D}\,dW_t,\qquad\Omega=2\pi f")
-    st.latex(rf"dX_t=\left[{model.latex(True)}+{config.A:g}\cos({omega:.6g}t)\right]dt+{np.sqrt(2*D):.6g}\,dW_t")
-    st.latex(r"X_{n+1}=X_n+[-U'(X_n)+A\cos(\Omega t_n)]\Delta t+\sqrt{2D\Delta t}\,\xi_n,\quad\xi_n\sim\mathcal N(0,1)")
+    if config.noise_kind=="white":
+        st.latex(r"dX_t=[-U'(X_t)+A\cos(\Omega t)]dt+\sqrt{2D}\,dW_t,\qquad\Omega=2\pi f")
+        st.latex(rf"dX_t=\left[{model.latex(True)}+{config.A:g}\cos({omega:.6g}t)\right]dt+{np.sqrt(2*D):.6g}\,dW_t")
+        st.latex(r"\Delta K_n=\sqrt{2D\Delta t}\,\xi_n,\quad\xi_n\sim\mathcal N(0,1)")
+    else:
+        st.latex(r"dX_t=[-U'(X_t)+A\cos(\Omega t)+\eta_t]dt,\quad\Delta K_n=\int_{t_n}^{t_{n+1}}\eta_s\,ds")
+        st.latex(r"\langle\eta_t\eta_{t+s}\rangle=\frac D\tau e^{-|s|/\tau},\quad\int_0^\infty C_\eta(s)\,ds=D")
+        if config.noise_kind=="ou":
+            st.latex(r"d\eta_t=-\eta_t\,dt/\tau+\sqrt{2D}\,dW_t/\tau")
+        else:
+            st.latex(r"\eta_t\in\{-\sqrt{D/\tau},+\sqrt{D/\tau}\},\quad\lambda_{flip}=1/(2\tau)")
+        st.write("ノイズの区間積分を直接生成します。以下のFP・Kramers式は白色ノイズ用の参照式で、現在のノイズには適用しません。")
+    st.latex(r"b(x,t)=-U'(x)+A\cos(\Omega t),\quad X^*=X_n+b(X_n,t_n)\Delta t+\Delta K_n")
+    if config.scheme=="heun":
+        st.latex(r"X_{n+1}=X_n+\tfrac12[b(X_n,t_n)+b(X^*,t_{n+1})]\Delta t+\Delta K_n")
+    else:
+        st.latex(r"X_{n+1}=X^*")
     st.latex(rf"\Delta t={dt:.8g},\quad\sqrt{{2D\Delta t}}={np.sqrt(2*D*dt):.6g},\quad T_\Omega={1/config.f:.6g},\quad T_\Omega/2={1/(2*config.f):.6g}")
     st.subheader("PSDとS/N比")
     st.latex(r"\widehat S_g(\nu_k)=\frac{1}{M}\sum_{m=1}^{M}\frac{c_k}{f_s\sum_n w_n^2}\left|\sum_n w_n(g_{m,n}-\bar g_m)e^{-2\pi i kn/N_s}\right|^2")
@@ -51,7 +68,9 @@ def render_equations(st, model: PotentialModel, config: SimConfig, spectral: Spe
     st.latex(r"\partial_t p=-\partial_x\{[-U'(x)+A\cos(\Omega t)]p\}+D\partial_x^2p,\qquad J(x_{min},t)=J(x_{max},t)=0")
     st.latex(r"\dot{\mathbf p}=Q(F)\mathbf p,\quad q_{i+1,i}=\frac{D}{\Delta x^2}\mathcal B\!\left(\frac{U_{i+1}-U_i-F\Delta x}{D}\right),\quad \mathcal B(z)=\frac{z}{e^z-1}")
     st.latex(r"[I-\Delta t_{FP}Q(F_{n+1})]\mathbf p_{n+1}=\mathbf p_n")
-    st.write("密度の時間発展は周期外力を含む直接解。SNR掃引は以下の弱外力線形応答で計算します。両者を同一の厳密計算とは扱いません。")
+    st.write("SNR掃引は弱外力線形応答。検証タブでは有限振幅の周期状態と二時刻相関を直接計算できます。空間・時間・位相の分解能と相関の打切りを別途確認します。")
+    st.latex(r"C_{inc}(s)=\frac1T\int_0^T\{\langle g(X_{t+s})g(X_t)\rangle-m(t+s)m(t)\}\,dt")
+    st.latex(r"S_{inc}^{(1)}(\nu)=4\int_0^\infty C_{inc}(s)\cos(2\pi\nu s)\,ds,\quad P_{coh}=\tfrac12\left|\frac2T\int_0^T m(t)e^{-i\Omega t}\,dt\right|^2")
     st.latex(r"Q_0\mathbf p_0=0,\quad (i\Omega I-Q_0)\mathbf p_1=\left.\frac{\partial Q}{\partial F}\right|_{F=0}\mathbf p_0,\quad\chi_g=\mathbf g^T\mathbf p_1")
     st.latex(r"\mathbf g_c=\mathbf g-\langle g\rangle_0,\quad S_{g,0}^{(1)}(\nu)=4\operatorname{Re}\!\left[\mathbf g_c^T(i2\pi\nu I-Q_0)^{-1}(\mathbf p_0\odot\mathbf g_c)\right]")
     st.latex(r"P_{coh}=\frac{A^2|\chi_g(\Omega)|^2}{2},\quad\mathrm{SNR}_{LR}=\frac{P_{coh}}{B\,\operatorname{mean}_{k\in B_N}S_{g,0}^{(1)}(\nu_k)},\quad\eta=|\chi_g|^2")
@@ -59,7 +78,7 @@ def render_equations(st, model: PotentialModel, config: SimConfig, spectral: Spe
     st.subheader("Kramersと時間尺度")
     st.latex(r"r_{i\to j}\simeq\frac{\sqrt{U''(x_i)|U''(x_b)|}}{2\pi}\exp\!\left[-\frac{U(x_b)-U(x_i)}D\right],\quad\tau_i=\frac1{\sum_jr_{i\to j}}")
     st.latex(r"\dot p_i=\sum_{j\ne i}(r_{j\to i}p_j-r_{i\to j}p_i)")
-    rates=kramers.rate_table(model,D,config.f)
+    rates=kramers.rate_table(model,D,config.f) if config.noise_kind=="white" else []
     if rates:
         for r in rates:
             st.latex(rf"r_{{{r['source']}\to{r['target']}}}\simeq {r['prefactor']:.6g}\exp\!\left(-\frac{{{r['delta_u']:.6g}}}{{{D:.6g}}}\right)={r['rate']:.6g}")
@@ -75,3 +94,4 @@ def render_equations(st, model: PotentialModel, config: SimConfig, spectral: Spe
     with st.expander("参考資料"):
         for title,url in REFERENCES:
             st.markdown(f"[{title}]({url})")
+
